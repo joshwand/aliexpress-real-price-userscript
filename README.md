@@ -2,6 +2,12 @@
 
 A userscript that enhances AliExpress product listings by showing true prices including shipping costs and variant prices. This helps you avoid misleading listings where sellers put accessory variants as the primary price instead of the advertised item, or advertise the product cheaply but tack on shipping costs so the total price may be the same or even higher than competitors.
 
+## Screenshot
+
+<img src="before.png" alt="Before" height="300"/>
+🤔🤔🤔🤔
+<img src="after.png" alt="After" height="300"/>
+
 ## Features
 
 - Shows complete price ranges including shipping costs
