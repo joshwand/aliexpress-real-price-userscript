@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AliExpress Real Price
 // @namespace    https://github.com/joshwand/aliexpress-real-price-userscript
-// @version      1.0.0
+// @version      1.0.1
 // @description  Shows true prices including shipping and variants on AliExpress, since sellers often misleadingly put accessory variants as the primary price, not the advertised item. 
 // @author       Josh Wand
 // @license      GPL-3.0-or-later
@@ -21,11 +21,17 @@
 // @grant        unsafeWindow
 // ==/UserScript==
 
+
+
 (function() {
     'use strict';
 
     // --- Global Cache Disable Flag ---
     let isCacheDisabled = false;
+
+    // --- Globally scoped instance variables (within IIFE) ---
+    let dataManager = null; // To hold DataManager instance
+    // let loadingManager = null; // Keep loadingManager local to init for now
 
     // Debug logging utility
     const DEBUG = true;
@@ -72,13 +78,18 @@
                     this.backoffTime = 1000; // Reset backoff on success
                     return result;
                 } catch (error) {
-                    if (error.message?.includes('FAIL_SYS_ILLEGAL_ACCESS')) {
-                        log(`Rate limit exceeded, backing off for ${this.backoffTime}ms`);
+                    if (error.message?.includes('FAIL_SYS_ILLEGAL_ACCESS') || error.message?.includes('FAIL_SYS_USER_VALIDATE')) {
+                        log(`Rate limit or validation error encountered (${error.message}), backing off for ${this.backoffTime}ms`);
+                        // Check if we've already reached max backoff
+                        if (this.backoffTime >= this.maxBackoffTime) {
+                            log(`Max backoff time (${this.maxBackoffTime}ms) reached. Failing request.`);
+                            throw error; // Rethrow the error to stop retrying
+                        }
                         await new Promise(resolve => setTimeout(resolve, this.backoffTime));
                         this.backoffTime = Math.min(this.backoffTime * 2, this.maxBackoffTime);
                         continue;
                     }
-                    throw error;
+                    throw error; // Rethrow other errors immediately
                 }
             }
         }
@@ -89,8 +100,19 @@
         constructor() {
             this.totalItems = 0;
             this.completedItems = 0;
+            this.isDragging = false;
+            this.startX = 0;
+            this.startY = 0;
+            this.initialLeft = 0;
+            this.initialTop = 0;
+            this.containerWidth = 0; // Store dimensions for smoother dragging
+            this.containerHeight = 0;
+            this.latestX = 0; // Store latest mouse coords for RAF
+            this.latestY = 0;
+            this.rafId = null; // ID for requestAnimationFrame
             this.createElements();
             this.addStyles(); // Add styles for the elements
+            this.setupDragging(); // Initialize dragging functionality
         }
 
         createElements() {
@@ -134,6 +156,9 @@
             this.tooltip.textContent = 'Advanced Options';
             this.disclosureArrow.appendChild(this.tooltip);
 
+            // Prevent dragging when clicking the arrow
+            this.disclosureArrow.addEventListener('mousedown', (e) => e.stopPropagation());
+
             // Restore click handler
             this.disclosureArrow.onclick = () => {
                 const container = this.settingsContainer;
@@ -156,6 +181,8 @@
             this.clearCacheButton = document.createElement('span');
             this.clearCacheButton.className = 'ali-real-price-clear-cache';
             this.clearCacheButton.textContent = 'Clear Cache';
+            // Prevent dragging when clicking the button
+            this.clearCacheButton.addEventListener('mousedown', (e) => e.stopPropagation());
             this.clearCacheButton.onclick = async () => {
                 await clearCacheAndReload();
             };
@@ -177,6 +204,8 @@
             this.disableCacheLabel.htmlFor = 'ali-real-price-disable-cache-checkbox';
             this.disableCacheLabel.textContent = 'Disable Cache';
             this.disableCacheLabel.className = 'ali-real-price-disable-cache-label';
+            // Prevent dragging when interacting with the checkbox/label
+            this.disableCacheContainer.addEventListener('mousedown', (e) => e.stopPropagation());
 
             this.disableCacheContainer.appendChild(this.disableCacheCheckbox);
             this.disableCacheContainer.appendChild(this.disableCacheLabel);
@@ -220,6 +249,7 @@
             styleElement.textContent = `
                 .ali-real-price-status-container {
                     position: fixed;
+                    /* Keep initial top/right for startup */
                     top: 10px;
                     right: 10px;
                     z-index: 99999;
@@ -229,7 +259,7 @@
                     border-radius: 4px;
                     box-shadow: 0 2px 5px rgba(0,0,0,0.3);
                     transition: all 0.3s ease;
-                    cursor: pointer;
+                    cursor: grab; /* Make the whole container draggable */
                     display: flex; /* Use flexbox by default */
                     align-items: flex-start; /* Align items to top */
                     gap: 8px; /* Space between icon and content */
@@ -237,20 +267,34 @@
                     opacity: 0;
                 }
 
+                /* Disable transitions and use grabbing cursor while dragging */
+                .ali-real-price-status-container.dragging-active {
+                    transition: none !important;
+                    cursor: grabbing !important;
+                }
+
                 .ali-real-price-status-container.visible {
                     visibility: visible;
                     opacity: 1;
+                    flex-shrink: 0; /* Prevent icon from shrinking */
+                    /* Remove cursor style from icon */
                 }
 
                 .ali-real-price-icon {
                     font-size: 16px;
                     flex-shrink: 0; /* Prevent icon from shrinking */
+                    cursor: grab; /* Indicate draggability */
                 }
+                /* Removed .ali-real-price-icon.dragging */
 
                 .ali-real-price-expandable-content {
                     display: none;
                     flex-grow: 1; /* Allow content to grow */
                     min-width: 0; /* Allow content to shrink if needed */
+                    margin-left: 5px;
+                    cursor: pointer; /* Keep pointer for the arrow */
+                    color: #666;
+                    position: relative;
                 }
 
                 .ali-real-price-status-container.expanded .ali-real-price-expandable-content {
@@ -269,6 +313,11 @@
                     cursor: pointer;
                     color: #666;
                     position: relative;
+                }
+
+                /* Ensure arrow doesn't get grab cursor */
+                .ali-real-price-status-container .ali-real-price-disclosure-arrow {
+                    cursor: pointer !important;
                 }
 
                 .ali-real-price-tooltip {
@@ -357,6 +406,101 @@
             document.head.appendChild(styleElement);
         }
 
+        setupDragging() {
+            // Keep initial CSS positioning (top/right)
+            // We will switch to left/top positioning only when dragging starts
+
+            const onMouseDown = (e) => {
+                // Only drag with left mouse button
+                if (e.button !== 0) return;
+
+                this.isDragging = true;
+                this.container.classList.add('dragging-active'); // Add class to disable transitions
+                this.iconContainer.classList.add('dragging');
+                this.startX = e.clientX;
+                this.startY = e.clientY;
+
+                // Get current position and dimensions *before* changing styles
+                const rect = this.container.getBoundingClientRect();
+                this.initialLeft = rect.left;
+                this.initialTop = rect.top;
+                this.containerWidth = this.container.offsetWidth;
+                this.containerHeight = this.container.offsetHeight;
+
+                // Store initial mouse position relative to the drag start
+                this.latestX = e.clientX;
+                this.latestY = e.clientY;
+
+                // Switch to left/top positioning for the drag operation
+                this.container.style.right = 'auto';
+                this.container.style.left = `${this.initialLeft}px`;
+                this.container.style.top = `${this.initialTop}px`;
+
+                // Add listeners to the document to capture mouse movements anywhere
+                document.addEventListener('mousemove', onMouseMove);
+                document.addEventListener('mouseup', onMouseUp);
+                // Prevent text selection during drag
+                e.preventDefault();
+            };
+
+            const onMouseMove = (e) => {
+                if (!this.isDragging) return;
+
+                // Store the latest mouse position
+                this.latestX = e.clientX;
+                this.latestY = e.clientY;
+
+                // Schedule an update if one isn't already pending
+                if (!this.rafId) {
+                    this.rafId = requestAnimationFrame(updatePosition);
+                }
+            };
+
+            // This function performs the actual position update within an animation frame
+            const updatePosition = () => {
+                if (!this.isDragging) {
+                    this.rafId = null; // Clear RAF ID if dragging stopped
+                    return;
+                }
+
+                const dx = this.latestX - this.startX;
+                const dy = this.latestY - this.startY;
+
+                let newLeft = this.initialLeft + dx;
+                let newTop = this.initialTop + dy;
+
+                // Boundary checks using stored dimensions
+                newLeft = Math.max(0, Math.min(newLeft, window.innerWidth - this.containerWidth));
+                newTop = Math.max(0, Math.min(newTop, window.innerHeight - this.containerHeight));
+
+                this.container.style.left = `${newLeft}px`;
+                this.container.style.top = `${newTop}px`;
+
+                // Allow the next frame to be scheduled
+                this.rafId = null;
+            };
+
+            const onMouseUp = () => {
+                if (!this.isDragging) return;
+
+                this.isDragging = false;
+                this.container.classList.remove('dragging-active'); // Remove class to re-enable transitions
+                this.iconContainer.classList.remove('dragging');
+                // Remove global listeners
+                document.removeEventListener('mousemove', onMouseMove);
+                document.removeEventListener('mouseup', onMouseUp);
+
+                // Cancel any pending animation frame
+                if (this.rafId) {
+                    cancelAnimationFrame(this.rafId);
+                    this.rafId = null;
+                }
+            };
+
+            // Attach the mousedown listener to the whole container
+            this.container.addEventListener('mousedown', onMouseDown);
+        }
+
         startLoading(totalItems) {
             this.totalItems = totalItems;
             this.updateProgress();
@@ -393,30 +537,30 @@
     }
 
     // Global loading manager instance
-    const loadingManager = new LoadingManager();
+    const loadingManager = new LoadingManager(); // Keep creation here as before
 
-    // Global rate limiter instance
-    const rateLimiter = new RateLimiter();
-
-    // Global cache instance
-    let globalCache;
+    // Global rate limiter instances
+    const apiRateLimiter = new RateLimiter(2, 1000); 
+    const pageFetchRateLimiter = new RateLimiter(1, 1000); 
+    // REMOVED: let globalCache;
 
     // Function to clear cache and reload
     async function clearCacheAndReload() {
         try {
-            if (globalCache) {
-                log('Clearing cache...');
-                await globalCache.clear();
+            // Access CacheManager via the IIFE-scoped dataManager instance
+            if (dataManager && dataManager.cacheManager) { 
+                log('Clearing cache via dataManager.cacheManager...');
+                await dataManager.cacheManager.clear(); // Use the correct instance property
                 alert('AliExpress Real Price cache cleared. Reloading page.');
                 window.location.reload();
-            } else {
-                log('Cache instance not found');
-                alert('Cache instance not found.');
-            }
-        } catch (error) {
-            log('Error clearing cache:', error);
-            alert('Error clearing cache. See console for details.');
-        }
+             } else {
+                log('DataManager or CacheManager instance not found for clearing.');
+                alert('Cache manager instance not found.');
+             }
+         } catch (error) {
+             log('Error clearing cache:', error);
+             alert('Error clearing cache. See console for details.');
+         }
     }
 
     log('Script starting...');
@@ -615,6 +759,15 @@
         .ali-real-price-range {
             font-weight: bold;
             color: #333;
+            font-size: 20px;
+            line-height: 1;
+        }
+
+        .ali-real-price-shipping-note {
+            font-size: 12px;
+            color: #666;
+            font-weight: normal;
+            overflow: visible;
         }
 
         .ali-real-price-global-loading {
@@ -698,13 +851,13 @@
 
     // Cache configuration
     const CACHE_CONFIG = {
-        variants: { duration: 86400000, maxEntries: 100 },  // 24 hours
-        shipping: { duration: 86400000, maxEntries: 100 },  // 24 hours
-        context: { duration: 86400000, maxEntries: 10 }      // 24 hours
+        variants: { duration: 86400000, maxEntries: 10000 },  // 24 hours
+        shipping: { duration: 86400000, maxEntries: 10000 },  // 24 hours
+        context: { duration: 86400000, maxEntries: 10000 }      // 24 hours
     };
 
-    // DOM Selectors
-    const SELECTORS = {
+    // --- Default DOM Selectors ---
+    const DEFAULT_SELECTORS = {
         productCard: [
             '.search-card-item',         // Main search results
             '.lq_b.io_it',              // Alternative class combination
@@ -726,7 +879,7 @@
             'span[class*="price"]',
             '[data-price]',             // Data attribute
             '[data-product-price]'
-        ].join(','),
+        ],
         title: [
             '.lq_jl',                   // Product title
             '.lq_ae h3'                 // Title wrapper
@@ -752,6 +905,12 @@
             'div[class*="SkuItem"]'
         ].join(',')
     };
+
+    // --- Effective Selectors (Defaults + Custom) ---
+    let effectivePriceSelectors = []; // Will be populated in init
+
+    // Set to store newly learned selectors during this session
+    const newlyFoundSelectors = new Set();
 
     // Utility functions
     const utils = {
@@ -820,66 +979,86 @@
         generateSign(token, timestamp, appKey, data) {
             const signStr = `${token}&${timestamp}&${appKey}&${data}`;
             return md5(signStr);
+        },
+
+        // Generate a CSS selector from a className string
+        generateSelectorFromClasses(className) {
+            if (!className || typeof className !== 'string') {
+                return null;
+            }
+            // Trim, split by whitespace, filter empty, prepend dot, join
+            const selector = className.trim().split(/\s+/).filter(Boolean).map(cls => `.${cls}`).join('');
+            return selector || null; // Return null if no valid classes found
         }
     };
 
     // Cache Manager
     class CacheManager {
         constructor() {
-            this.cache = new Map();
-            // Load immediately, respecting the flag set during init
-            this.loadFromStorage();
+            this._cache = new Map(); // Renamed internal cache
+            // Removed flags, timeouts, locks, timestamps
+            // Load is now handled by initialize()
+        }
+
+        async initialize() {
+            log('[CacheManager] Initializing... attempting to load cache from storage.');
+            await this.loadFromStorage();
+            log('[CacheManager] Initialization complete (cache loaded).');
         }
 
         async loadFromStorage() {
             if (isCacheDisabled) {
                 log('Cache is disabled, skipping load from storage.');
-                this.cache.clear();
+                this._cache.clear();
                 return;
             }
             try {
                 const storedCache = await GM.getValue('aliexpress_cache', null);
                 if (storedCache) {
                     const parsed = JSON.parse(storedCache);
-                    // Only load non-expired entries
+                    this._cache.clear(); // Use internal property
                     Object.entries(parsed).forEach(([key, entry]) => {
                         if (Date.now() <= entry.expiresAt) {
-                            this.cache.set(key, entry);
+                            this._cache.set(key, entry); // Use internal property
                         }
                     });
-                    log('Loaded cache from storage:', this.cache.size, 'entries');
+                    log('Loaded cache from storage:', this._cache.size, 'entries');
+                } else {
+                    log('No cache found in storage');
                 }
             } catch (error) {
                 log('Error loading cache from storage:', error);
             }
         }
 
+        // Simplified direct save
         async saveToStorage() {
             if (isCacheDisabled) {
-                // log('Cache is disabled, skipping save to storage.'); // Maybe too noisy
-                return; // Don't save if cache is disabled
+                 log('Save skipped: Cache is disabled.');
+                 return;
             }
+            log(`Saving cache with ${this._cache.size} entries...`);
             try {
-                // Convert Map to object for storage
                 const cacheObj = {};
-                this.cache.forEach((value, key) => {
+                this._cache.forEach((value, key) => { // Use internal property
                     cacheObj[key] = value;
                 });
                 await GM.setValue('aliexpress_cache', JSON.stringify(cacheObj));
-                log('Saved cache to storage:', Object.keys(cacheObj).length, 'entries');
+                log('Finished saving cache.');
             } catch (error) {
                 log('Error saving cache to storage:', error);
             }
         }
 
         async get(key) {
-            if (isCacheDisabled) return null; // Bypass cache if disabled
-            const entry = this.cache.get(key);
+            if (isCacheDisabled) return null;
+            const entry = this._cache.get(key); // Use internal property
             if (!entry) return null;
 
             if (Date.now() > entry.expiresAt) {
-                this.cache.delete(key);
-                await this.saveToStorage();
+                log(`Cache entry expired and removed: ${key}`);
+                this._cache.delete(key); // Use internal property
+                await this.saveToStorage(); // Save immediately after deleting expired entry
                 return null;
             }
 
@@ -887,47 +1066,62 @@
         }
 
         async set(key, data, config) {
-            if (isCacheDisabled) return; // Bypass cache if disabled
+            if (isCacheDisabled) return;
 
-            // Check if config is provided, otherwise use a default or skip
             if (!config || !config.maxEntries || !config.duration) {
-                log('Cache config missing for key:', key, ' Using default or skipping.');
-                // Define a default config or return if you don't want to cache without specific config
-                config = CACHE_CONFIG.variants; // Example: Default to variants config
-                // Or simply return if caching requires explicit config
-                // return;
+                log('Cache config missing for key:', key, ' Using default config.');
+                config = CACHE_CONFIG.variants;
             }
 
-            if (this.cache.size >= config.maxEntries) {
-                const oldestKey = this.cache.keys().next().value;
-                this.cache.delete(oldestKey);
+            const exists = this._cache.has(key);
+            const currentSizeBefore = this._cache.size;
+
+            // Eviction logic
+            if (!exists && currentSizeBefore >= config.maxEntries) {
+                const oldestKey = this._cache.keys().next().value; // Use internal property
+                if (oldestKey) {
+                    log(`Cache limit (${config.maxEntries}) would be exceeded by adding ${key}. Evicting oldest: ${oldestKey}`);
+                    this._cache.delete(oldestKey); // Use internal property
+                } else {
+                     log('Cache limit reached, but failed to find oldest key to evict.');
+                }
             }
 
-            this.cache.set(key, {
+            log(`CacheManager.set: Setting key=${key}. Existed=${exists}. Size before=${currentSizeBefore}`);
+            this._cache.set(key, { // Use internal property
                 data,
                 timestamp: Date.now(),
                 expiresAt: Date.now() + config.duration
             });
+            const currentSizeAfter = this._cache.size;
+            log(`CacheManager.set: Set key=${key}. Size after=${currentSizeAfter}.`);
 
-            await this.saveToStorage();
+            await this.saveToStorage(); // Save immediately after setting entry
         }
 
+        // Simplified Clear
         async clear() {
-            this.cache.clear();
-            // Always allow clearing storage, even if cache is currently disabled
-            await GM.setValue('aliexpress_cache', '{}');
-            log('Cache cleared');
+            log('Clearing cache map...');
+            this._cache.clear(); // Use internal property
+            await this.saveToStorage(); // Save immediately after clearing
         }
+
+        // Removed forceSave, scheduleSave, _saveToStorageInternal, _markDirty etc.
     }
 
     // Data Manager
     class DataManager {
-        constructor() {
-            this.cache = new CacheManager();
+        constructor(cacheManagerInstance) { // Accept CacheManager instance
+            this.cacheManager = cacheManagerInstance; // Store the instance
             this.tokenInitialized = false;
+            // Removed fetchingInProgress
         }
 
-        // Initialize token by making a simple request to AliExpress
+        // REMOVED initialize method
+        // REMOVED loadFromStorage method
+        // REMOVED _waitForFetchAndCheckCache method
+
+        // Token initialization remains
         async initializeToken() {
             if (this.tokenInitialized) {
                 return;
@@ -992,293 +1186,265 @@
         }
 
         async fetchProductData(productId) {
-            log('Fetching product data for ID:', productId, { productId });
+            log('[DataManager] Fetching product data for ID:', productId, { productId });
             const cacheKey = `product_${productId}`;
-            const cachedData = await this.cache.get(cacheKey);
+            
+            // Use the cache manager's get method
+            const cachedData = await this.cacheManager.get(cacheKey);
             if (cachedData) {
-                log(`[ARP_EnhanceFlow] [fetchProductData] Found cached data for product: ${productId}. Returning it.`, { productId });
+                log(`[DataManager] Found cached data for product: ${productId}. Returning it.`, { productId });
                 return cachedData;
+            } else {
+                log(`[DataManager] No cached data found for product: ${productId}. Proceeding to fetch.`, { productId });
             }
+            
+            // Removed fetch locking logic
+            
+            let productData = null; // Basic data from card
+            let fetchedData = null; // To store the final data to be cached
 
-            try {
-                // First get quick data from card
-                const card = document.querySelector(`a[href*="${productId}"]`);
-                let productData = null;
-                
-                if (card) {
-                    log('Found product card, extracting basic info');
-                    const title = card.querySelector(SELECTORS.title)?.textContent?.trim() || '';
-                    const priceContainer = card.querySelector(SELECTORS.price);
-                    const priceInfo = this.extractPriceFromElement(priceContainer);
-                    const shippingElement = card.querySelector(SELECTORS.shipping);
-                    const shippingInfo = this.extractShippingFromElement(shippingElement);
-                    const discountElement = card.querySelector(SELECTORS.discount);
-                    const discountInfo = this.extractDiscountFromElement(discountElement);
+            // Outer try...finally removed as lock is gone
+            try { // Renamed from inner try
+                 // First get quick data from card
+                 const card = document.querySelector(`a[href*="${productId}"]`);
+                 if (card) {
+                     log('Found product card, extracting basic info', { productId });
+                     const title = card.querySelector(DEFAULT_SELECTORS.title)?.textContent?.trim() || '';
+                     const priceContainer = card.querySelector(effectivePriceSelectors.join(',')); // USE EFFECTIVE SELECTORS
+                     const priceInfo = this.extractPriceFromElement(priceContainer);
+                     const shippingElement = card.querySelector(DEFAULT_SELECTORS.shipping);
+                     const shippingInfo = this.extractShippingFromElement(shippingElement);
+                     const discountElement = card.querySelector(DEFAULT_SELECTORS.discount);
+                     const discountInfo = this.extractDiscountFromElement(discountElement);
 
-                    productData = {
-                        productId,
-                        title,
-                        variants: [{
-                            id: 'default',
-                            name: 'Default',
-                            price: {
-                                value: priceInfo.original || priceInfo.current,
-                                formattedPrice: utils.formatPrice(priceInfo.original || priceInfo.current),
-                                discountedValue: priceInfo.current,
-                                discountedFormattedPrice: utils.formatPrice(priceInfo.current),
-                                discount: discountInfo.percentage || ''
-                            },
-                            shipping: {
-                                cost: shippingInfo.cost || 0,
-                                formattedPrice: utils.formatPrice(shippingInfo.cost || 0),
-                                freeThreshold: shippingInfo.freeThreshold
-                            },
-                            stock: 999,
-                            isMainProduct: true
-                        }]
-                    };
-                }
+                     productData = {
+                         productId,
+                         title,
+                         variants: [{
+                             id: 'default',
+                             name: 'Default',
+                             price: {
+                                 value: priceInfo.original || priceInfo.current,
+                                 formattedPrice: utils.formatPrice(priceInfo.original || priceInfo.current),
+                                 discountedValue: priceInfo.current,
+                                 discountedFormattedPrice: utils.formatPrice(priceInfo.current),
+                                 discount: discountInfo.percentage || ''
+                             },
+                             shipping: {
+                                 cost: shippingInfo.cost || 0,
+                                 formattedPrice: utils.formatPrice(shippingInfo.cost || 0),
+                                 freeThreshold: shippingInfo.freeThreshold
+                             },
+                             stock: 999,
+                             isMainProduct: true
+                         }]
+                     };
+                     log('Extracted basic product data from card', { productId, productData });
+                 }
 
-                // // Try to fetch full product data using the direct Taobao API
-                // try {
-                //     log('Trying direct Aliexpress API call');
-                //     const apiData = await this.fetchDirectAliExpressAPI(productId);
-                //     if (apiData) {
-                //         log('Successfully fetched data from direct Aliexpress API', { apiData});
-                //         await this.cache.set(cacheKey, apiData, CACHE_CONFIG.variants);
-                //         return apiData;
-                //     }
-                // } catch (directApiError) {
-                //     log(`Direct Taobao API call failed for productId ${productId}:`, directApiError);
-                // }
+                 // Attempt main API call (wrapped with rate limiter)
+                 try {
+                     log(`Attempting main API call for ${productId}`, { productId });
+                     const apiResponseData = await apiRateLimiter.executeWithBackoff(async () => {
+                         // This inner function performs ONE attempt
+                         const token = utils.getCookie('_m_h5_tk')?.split('_')[0];
+                         if (!token) {
+                             // Can't proceed with API call without token
+                             throw new Error('No token found for API call');
+                         }
+                         log('Found token for API call:', token, { productId });
+                         const timestamp = Date.now();
+                         const appKey = '12574478';
+                         const apiVersion = '1.0';
+                         const requestData = {
+                             productId,
+                             _lang: 'en_US',
+                             _currency: 'USD',
+                             country: 'US',
+                             province: '922867650000000000',
+                             city: '922867656497000000',
+                             channel: '',
+                             pdp_ext_f: '{"order":"10","eval":"1"}',
+                             sourceType: '',
+                             clientType: 'pc',
+                             ext: JSON.stringify({
+                                 site: 'usa',
+                                 crawler: false,
+                                 'x-m-biz-bx-region': '',
+                                 signedIn: true,
+                                 host: 'www.aliexpress.us'
+                             })
+                         };
+                         const dataStr = JSON.stringify(requestData);
+                         const sign = utils.generateSign(token, timestamp, appKey, dataStr);
+                         log('Generated sign for API call:', sign, { productId });
 
-                // Try to fetch full product data using the API
-                try {
-                    // Get token from cookies
-                    const token = utils.getCookie('_m_h5_tk')?.split('_')[0];
-                    if (!token) {
-                        log(`No token found in cookies, trying to fetch product page data for productId ${productId}`);
-                        const pageData = await this.fetchDataFromProductPage(productId);
-                        if (pageData) {
-                            await this.cache.set(cacheKey, pageData, CACHE_CONFIG.variants);
-                            return pageData;
-                        }
-                        
-                        if (productData) {
-                            await this.cache.set(cacheKey, productData, CACHE_CONFIG.variants);
-                            return productData;
-                        }
-                        throw new Error('No token found and no fallback data available');
-                    }
-                    
-                    log('Found token:', token);
-                    
-                    // Prepare API request
-                    const timestamp = Date.now();
-                    const appKey = '12574478';
-                    const apiVersion = '1.0';
-                    
-                    // Construct the request data object
-                    const requestData = {
-                        productId,
-                        _lang: 'en_US',
-                        _currency: 'USD',
-                        country: 'US',
-                        province: '922867650000000000',
-                        city: '922867656497000000',
-                        channel: '',
-                        pdp_ext_f: '{"order":"10","eval":"1"}',
-                        sourceType: '',
-                        clientType: 'pc',
-                        ext: JSON.stringify({
-                            site: 'usa',
-                            crawler: false,
-                            'x-m-biz-bx-region': '',
-                            signedIn: true,
-                            host: 'www.aliexpress.us'
-                        })
-                    };
-                    
-                    // Convert request data to JSON string
-                    const dataStr = JSON.stringify(requestData);
-                    
-                    // Generate sign
-                    const sign = utils.generateSign(token, timestamp, appKey, dataStr);
-                    log('Generated sign:', sign);
-                    
-                    // Construct the API URL with all parameters
-                    const baseUrl = 'https://acs.aliexpress.us/h5/mtop.aliexpress.pdp.pc.query/1.0/';
-                    const params = new URLSearchParams({
-                        jsv: '2.5.1',
-                        appKey,
-                        t: timestamp,
-                        sign,
-                        api: 'mtop.aliexpress.pdp.pc.query',
-                        type: 'originaljsonp',
-                        v: apiVersion,
-                        timeout: '15000',
-                        dataType: 'originaljsonp',
-                        callback: 'mtopjsonp1',
-                        data: dataStr
-                    });
+                         const baseUrl = 'https://acs.aliexpress.us/h5/mtop.aliexpress.pdp.pc.query/1.0/';
+                         const params = new URLSearchParams({
+                             jsv: '2.5.1',
+                             appKey,
+                             t: timestamp,
+                             sign,
+                             api: 'mtop.aliexpress.pdp.pc.query',
+                             type: 'originaljsonp',
+                             v: apiVersion,
+                             timeout: '15000',
+                             dataType: 'originaljsonp',
+                             callback: 'mtopjsonp1',
+                             data: dataStr
+                         });
 
-                    const apiUrl = `${baseUrl}?${params.toString()}`;
-                    log('Fetching from API URL:', apiUrl);
+                         const apiUrl = `${baseUrl}?${params.toString()}`;
+                         log('Fetching from API URL (within rate limiter):', apiUrl, { productId });
 
-                    return new Promise((resolve, reject) => {
-                        GM.xmlHttpRequest({
-                            method: 'GET',
-                            url: apiUrl,
-                            headers: {
-                                'accept': '*/*',
-                                'accept-language': 'en-US,en;q=0.9',
-                                'cache-control': 'no-cache',
-                                'pragma': 'no-cache',
-                                'referer': 'https://www.aliexpress.us/',
-                                'sec-ch-ua': '"Chromium";v="134", "Not:A-Brand";v="24", "Google Chrome";v="134"',
-                                'sec-ch-ua-mobile': '?0',
-                                'sec-ch-ua-platform': '"macOS"',
-                                'sec-fetch-dest': 'script',
-                                'sec-fetch-mode': 'no-cors',
-                                'sec-fetch-site': 'same-site',
-                                'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36'
-                            },
-                            withCredentials: true, // Important: send cookies with the request
-                            onload: (response) => {
-                                try {
-                                    // log(`Received raw API response: ${response.responseText}`);
-                                    
-                                    // Extract JSON from JSONP response
-                                    const jsonMatch = response.responseText.match(/mtopjsonp1\((.*)\)/);
-                                    if (!jsonMatch) {
-                                        throw new Error('Invalid JSONP response format');
-                                    }
+                         return new Promise((resolve, reject) => {
+                             GM.xmlHttpRequest({
+                                 method: 'GET',
+                                 url: apiUrl,
+                                 headers: {
+                                     'accept': '*/*',
+                                     'accept-language': 'en-US,en;q=0.9',
+                                     'cache-control': 'no-cache',
+                                     'pragma': 'no-cache',
+                                     'referer': 'https://www.aliexpress.us/',
+                                     'sec-ch-ua': '"Chromium";v="134", "Not:A-Brand";v="24", "Google Chrome";v="134"',
+                                     'sec-ch-ua-mobile': '?0',
+                                     'sec-ch-ua-platform': '"macOS"',
+                                     'sec-fetch-dest': 'script',
+                                     'sec-fetch-mode': 'no-cors',
+                                     'sec-fetch-site': 'same-site',
+                                     'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36'
+                                 },
+                                 withCredentials: true,
+                                 onload: (response) => {
+                                     try {
+                                         const jsonMatch = response.responseText.match(/mtopjsonp1\((.*)\)/);
+                                         if (!jsonMatch) {
+                                             log('Invalid JSONP response format (within rate limiter):', { productId, responseText: response.responseText });
+                                             return reject(new Error('Invalid JSONP response format'));
+                                         }
+                                         const parsedResponse = JSON.parse(jsonMatch[1]);
+                                         log('Parsed API response (within rate limiter):', { productId, parsedResponse });
 
-                                    const apiResponseData = JSON.parse(jsonMatch[1]);
-                                    log('Parsed API response:', {productId, apiResponseData});
+                                         if (parsedResponse.ret && parsedResponse.ret[0]?.startsWith('FAIL_')) {
+                                             log('API returned error (within rate limiter):', parsedResponse.ret[0], { productId });
+                                             // IMPORTANT: Let RateLimiter handle specific errors by rejecting with specific error
+                                             if (parsedResponse.ret[0].includes('FAIL_SYS_ILLEGAL_ACCESS') || parsedResponse.ret[0].includes('FAIL_SYS_USER_VALIDATE')) {
+                                                 return reject(new Error(parsedResponse.ret[0])); // Reject to trigger backoff in executeWithBackoff
+                                             } else {
+                                                 // For other API errors, reject differently so the outer catch can handle fallback
+                                                 return reject({ type: 'api_other_error', message: parsedResponse.ret[0] });
+                                             }
+                                         }
+                                         resolve(parsedResponse); // Resolve with successful data
+                                     } catch (parseError) {
+                                         log('Error processing API response (within rate limiter):', parseError, { productId });
+                                         reject({ type: 'parse_error', error: parseError }); // Reject for outer catch fallback
+                                     }
+                                 },
+                                 onerror: (error) => {
+                                     log('Error fetching API data (within rate limiter):', error, { productId });
+                                     reject({ type: 'network_error', error: error }); // Reject for outer catch fallback
+                                 }
+                             });
+                         });
+                     });
 
-                                    if (apiResponseData.ret && apiResponseData.ret[0]?.startsWith('FAIL_')) {
-                                        log('API returned error:', apiResponseData.ret[0]);
-                                        if (apiResponseData.ret[0].includes('FAIL_SYS_ILLEGAL_ACCESS')) {
-                                            throw new Error(apiResponseData.ret[0]); // This will trigger backoff
-                                        }
-                                        // Try to fetch product page data as fallback
-                                        this.fetchDataFromProductPage(productId).then(pageData => {
-                                            if (pageData) {
-                                                this.cache.set(cacheKey, pageData, CACHE_CONFIG.variants);
-                                                resolve(pageData);
-                                                return;
-                                            }
-                                            
-                                            if (productData) {
-                                                this.cache.set(cacheKey, productData, CACHE_CONFIG.variants);
-                                                resolve(productData);
-                                            } else {
-                                                reject(new Error(`API Error: ${apiResponseData.ret[0]}`));
-                                            }
-                                        }).catch(err => {
-                                            log('Error fetching product page data:', err);
-                                            if (productData) {
-                                                this.cache.set(cacheKey, productData, CACHE_CONFIG.variants);
-                                                resolve(productData);
-                                            } else {
-                                                reject(new Error(`API Error: ${apiResponseData.ret[0]}`));
-                                            }
-                                        });
-                                        return;
-                                    }
+                     // If executeWithBackoff succeeded:
+                     log(`Main API call successful for ${productId}`, { productId });
+                     const fullProductData = this.parseProductData(apiResponseData);
 
-                                    const fullProductData = this.parseProductData(apiResponseData);
-                                    
-                                    if (productData) {
-                                        fullProductData.variants = fullProductData.variants.length > 0 
-                                            ? fullProductData.variants 
-                                            : productData.variants;
-                                        
-                                        fullProductData.title = fullProductData.title || productData.title;
-                                    }
+                     // Merge basic data if needed (e.g., if API data is missing title)
+                     if (productData) {
+                         fullProductData.variants = fullProductData.variants.length > 0
+                             ? fullProductData.variants
+                             : productData.variants;
+                         fullProductData.title = fullProductData.title || productData.title;
+                     }
 
-                                    this.cache.set(cacheKey, fullProductData, CACHE_CONFIG.variants);
-                                    resolve(fullProductData);
+                     // Don't return yet, store data and cache at the end
+                     fetchedData = fullProductData;
+                     log(`[DataManager] Successfully fetched API data for ${productId}`, { productId });
 
-                                } catch (error) {
-                                    log('Error processing API response:', error);
-                                    // Try to fetch product page data as fallback
-                                    this.fetchDataFromProductPage(productId).then(pageData => {
-                                        if (pageData) {
-                                            this.cache.set(cacheKey, pageData, CACHE_CONFIG.variants);
-                                            resolve(pageData);
-                                            return;
-                                        }
-                                        
-                                        if (productData) {
-                                            this.cache.set(cacheKey, productData, CACHE_CONFIG.variants);
-                                            resolve(productData);
-                                        } else {
-                                            reject(error);
-                                        }
-                                    }).catch(err => {
-                                        log('Error fetching product page data:', err);
-                                        if (productData) {
-                                            this.cache.set(cacheKey, productData, CACHE_CONFIG.variants);
-                                            resolve(productData);
-                                        } else {
-                                            reject(error);
-                                        }
-                                    });
-                                }
-                            },
-                            onerror: (error) => {
-                                log('Error fetching API data:', error);
-                                // Try to fetch product page data as fallback
-                                this.fetchDataFromProductPage(productId).then(pageData => {
-                                    if (pageData) {
-                                        this.cache.set(cacheKey, pageData, CACHE_CONFIG.variants);
-                                        resolve(pageData);
-                                        return;
-                                    }
-                                    
-                                    if (productData) {
-                                        this.cache.set(cacheKey, productData, CACHE_CONFIG.variants);
-                                        resolve(productData);
-                                    } else {
-                                        reject(error);
-                                    }
-                                }).catch(err => {
-                                    log('Error fetching product page data:', err);
-                                    if (productData) {
-                                        this.cache.set(cacheKey, productData, CACHE_CONFIG.variants);
-                                        resolve(productData);
-                                    } else {
-                                        reject(error);
-                                    }
-                                });
-                            }
-                        });
-                    });
-                } catch (apiError) {
-                    log('API request failed, trying to fetch product page data:', apiError);
-                    try {
-                        const pageData = await this.fetchDataFromProductPage(productId);
-                        if (pageData) {
-                            this.cache.set(cacheKey, pageData, CACHE_CONFIG.variants);
-                            return pageData;
-                        }
-                    } catch (pageError) {
-                        log('Error fetching product page data:', pageError);
-                    }
-                    
-                    if (productData) {
-                        this.cache.set(cacheKey, productData, CACHE_CONFIG.variants);
-                        return productData;
-                    }
-                    throw apiError;
-                }
-            } catch (error) {
-                log('Error in fetchProductData:', error);
-                throw error;
-            }
-        }
+                 } catch (apiError) {
+                     // This catch block handles errors from executeWithBackoff OR rejected promises from GM.xmlHttpRequest
+                     log(`Main API call failed for ${productId}:`, apiError, { productId });
+
+                     if (apiError?.message?.includes('FAIL_SYS_ILLEGAL_ACCESS') || apiError?.message?.includes('FAIL_SYS_USER_VALIDATE')) {
+                         log('Rate limit error persisted after retries, attempting fallback.', { productId });
+                     } else if (apiError?.message === 'No token found for API call') {
+                         log('API call skipped due to missing token, attempting fallback.', { productId });
+                     } else {
+                         log('API call failed with other error, attempting fallback.', { productId });
+                     }
+
+                     // --- Fallback logic (fetch from page) ---
+                     try {
+                         log(`Trying fallback: fetching product page data for productId ${productId}`);
+                         // Wrap the fallback fetch with its own rate limiter
+                         const pageData = await pageFetchRateLimiter.executeWithBackoff(async () => {
+                             return await this.fetchDataFromProductPage(productId);
+                         });
+
+                         if (pageData) {
+                             // Merge basic data if needed
+                             if (productData) {
+                                 pageData.variants = pageData.variants.length > 0 ? pageData.variants : productData.variants;
+                                 pageData.title = pageData.title || productData.title;
+                             }
+                             // Don't return yet, store data and cache at the end
+                             fetchedData = pageData;
+                             log(`[DataManager] Successfully fetched fallback page data for ${productId}`, { productId });
+                         } else {
+                             log(`Fallback fetch from page returned no data for ${productId}`, { productId });
+                             // Continue to potentially return basic data
+                         }
+                     } catch (pageError) {
+                         log('Error fetching product page data during fallback:', pageError, { productId });
+                         // Continue to potentially return basic data
+                     }
+
+                     // If fallback fails OR returned no data, return basic data if available
+                     if (productData) {
+                         log(`[DataManager] Fallback/API failed, using basic product data for ${productId}`, { productId });
+                         // Store basic data to be cached
+                         fetchedData = productData;
+                     }
+
+                     // If absolutely nothing works, re-throw the original error that caused the fallback
+                     // Only rethrow if we didn't even get basic data
+                     if (!fetchedData) {
+                         log(`[DataManager] All fetch attempts failed for ${productId}, rethrowing API error.`, { productId });
+                         throw apiError;
+                     } else {
+                         log(`[DataManager] API/Fallback failed for ${productId}, but using basic data. Error was:`, apiError, { productId });
+                     }
+                 }
+             } catch (fetchParseError) {
+                  log('Error during data fetch/parse for', productId, fetchParseError, { productId });
+                  // If we already have basic data, use it. Otherwise, rethrow.
+                  if (productData && !fetchedData) {
+                      log(`[DataManager] Using basic data for ${productId} due to fetch/parse error.`, { productId });
+                      fetchedData = productData;
+                  } else if (!fetchedData) {
+                      // Consider if rethrowing is best, or returning null/empty
+                      log(`[DataManager] Error fetching ${productId} and no basic data available.`, { productId });
+                      // throw fetchParseError; // Or return null
+                      fetchedData = null; // Return null for simplicity
+                  }
+             }
+
+             // Cache the final fetched data (API, fallback, or basic)
+             if (fetchedData) {
+                 // Use the cache manager's set method
+                 await this.cacheManager.set(cacheKey, fetchedData, CACHE_CONFIG.variants);
+                  log(`[DataManager] Cached final data for ${productId}.`, { productId });
+             } else {
+                 log(`[DataManager] No data was fetched or determined for ${productId}, nothing to cache.`, { productId });
+             }
+             
+             return fetchedData; // Return whatever data we ended up with
+         }
 
         // Direct Taobao API call based on the shared resources
         async fetchDirectAliExpressAPI(productId) {
@@ -1864,31 +2030,31 @@
                         },
                         onload: (response) => {
                             try {
-                                log('Received product page response');
+                                log('Received product page response', { productId });
                                 
                                 // Extract product data from HTML
                                 const productData = this.extractProductDataFromHTML(response.responseText, productId);
                                 
                                 if (productData) {
-                                    log('Successfully extracted product data from HTML');
+                                    log('Successfully extracted product data from HTML', { productId });
                                     resolve(productData);
                                 } else {
-                                    log('Failed to extract product data from HTML');
+                                    log('Failed to extract product data from HTML', { productId });
                                     resolve(null);
                                 }
                             } catch (error) {
-                                log('Error processing product page response:', error);
+                                log('Error processing product page response:', error, { productId });
                                 resolve(null);
                             }
                         },
                         onerror: (error) => {
-                            log('Error fetching product page:', error);
+                            log('Error fetching product page:', error, { productId });
                             resolve(null);
                         }
                     });
                 });
             } catch (error) {
-                log('Error in fetchProductPageData:', error);
+                log('Error in fetchProductPageData:', error, { productId });
                 return null;
             }
         }
@@ -1896,7 +2062,7 @@
         // Extract product data from HTML
         extractProductDataFromHTML(html, productId) {
             try {
-                log('Extracting product data from HTML');
+                log('Extracting product data from HTML', { productId });
                 
                 // Create a temporary DOM element to parse the HTML
                 const parser = new DOMParser();
@@ -1916,10 +2082,10 @@
                         if (match && match[1]) {
                             try {
                                 productData = JSON.parse(match[1]);
-                                log('Found product data in runParams.data');
+                                log('Found product data in runParams.data', { productId });
                                 break;
                             } catch (e) {
-                                log('Error parsing runParams.data:', e);
+                                log('Error parsing runParams.data:', e, { productId });
                             }
                         }
                     }
@@ -1935,10 +2101,10 @@
                                 try {
                                     const state = JSON.parse(match[1]);
                                     productData = state.productDetail?.data;
-                                    log('Found product data in window.__INITIAL_STATE__');
+                                    log('Found product data in window.__INITIAL_STATE__', { productId });
                                     break;
                                 } catch (e) {
-                                    log('Error parsing window.__INITIAL_STATE__:', e);
+                                    log('Error parsing window.__INITIAL_STATE__:', e, { productId });
                                 }
                             }
                         }
@@ -1951,9 +2117,9 @@
                     if (jsonElement) {
                         try {
                             productData = JSON.parse(jsonElement.getAttribute('data-pdp-json'));
-                            log('Found product data in data-pdp-json attribute');
+                            log('Found product data in data-pdp-json attribute', { productId });
                         } catch (e) {
-                            log('Error parsing data-pdp-json:', e);
+                            log('Error parsing data-pdp-json:', e, { productId });
                         }
                     }
                 }
@@ -1968,10 +2134,10 @@
                                 try {
                                     const runParams = JSON.parse(match[1]);
                                     productData = runParams.data;
-                                    log('Found product data in window.runParams');
+                                    log('Found product data in window.runParams', { productId });
                                     break;
                                 } catch (e) {
-                                    log('Error parsing window.runParams:', e);
+                                    log('Error parsing window.runParams:', e, { productId });
                                 }
                             }
                         }
@@ -1979,7 +2145,7 @@
                 }
                 
                 if (!productData) {
-                    log('Could not find product data in HTML');
+                    log('Could not find product data in HTML', { productId });
                     return null;
                 }
                 
@@ -2054,7 +2220,7 @@
                     variants
                 };
             } catch (error) {
-                log('Error extracting product data from HTML:', error);
+                log('Error extracting product data from HTML:', error, { productId });
                 return null;
             }
         }
@@ -2065,7 +2231,7 @@
         calculatePageContext(productCards) {
             const prices = [];
             for (const card of productCards) {
-                const priceElement = card.querySelector(SELECTORS.price);
+                const priceElement = card.querySelector(effectivePriceSelectors.join(',')); // USE EFFECTIVE SELECTORS
                 if (priceElement) {
                     const price = this.extractPriceValue(priceElement.textContent);
                     if (price) prices.push(price);
@@ -2203,11 +2369,11 @@
 
             try {
                 // Try multiple strategies to find the price element
-                const priceSelectors = SELECTORS.price.split(',');
-                
+                const priceSelectors = effectivePriceSelectors; // USE EFFECTIVE SELECTORS
+
                 // Log all potential price elements for debugging
                 log('Searching for price element with selectors:', priceSelectors, { productId });
-                
+
                 for (const selector of priceSelectors) {
                     const elements = card.querySelectorAll(selector.trim());
                     if (elements.length > 0) {
@@ -2227,22 +2393,50 @@
                 }
 
                 if (!priceElement) {
-                    // If still not found, try searching deeper in the card
-                    log('No price element found with selectors, trying text pattern search', { productId });
-                    const allElements = card.getElementsByTagName('*');
+                    // If still not found, try searching deeper in the card with improved fallback
+                    log('No price element found with selectors, trying improved text pattern search', { productId });
+                    const allElements = card.getElementsByTagName('div');
+                    const potentialPriceElements = [];
                     for (const element of allElements) {
-                        const text = element.textContent;
-                        // Look for price-like patterns (e.g., $XX.XX)
-                        if (/\$\d+(\.\d{2})?/.test(text) && !element.querySelector('*')) {
-                            priceElement = element;
-                            log('Found price element using text pattern:', {
+                        // Look for price-like patterns (e.g., $XX.XX) AND ensure it's not a crossed-out price
+                        const text = element.textContent.trim();
+                        if (/^\$?\d{1,3}(?:[,.]\d{3})*(?:[.,]\d{2})?\s*$/.test(text) && 
+                            !window.getComputedStyle(element).textDecoration.includes('line-through')) {
+                            potentialPriceElements.push(element);
+                            log('Found potential price element via text pattern:', {
                                 productId,
                                 text,
-                                elementHtml: element.outerHTML,
-                                elementClass: element.className
+                                element,
+                                elementHtml: element.outerHTML
                             });
-                            break;
                         }
+                    }
+
+                    if (potentialPriceElements.length > 0) {
+                        // Apply the same "deepest element" logic as the selector method
+                        priceElement = potentialPriceElements.reduce((best, current) => {
+                            const bestDepth = this.getElementDepth(best);
+                            const currentDepth = this.getElementDepth(current);
+                            return currentDepth > bestDepth ? current : best;
+                        });
+                        log('Selected deepest price element from text pattern matches:', {
+                            productId,
+                            priceElement,
+                            elementHtml: priceElement.outerHTML,
+                            elementClass: priceElement.className
+                        });
+
+                        // --- Learn New Selector ---
+                        const newSelector = utils.generateSelectorFromClasses(priceElement.className);
+                        // Check if selector is valid and not already known from initial load
+                        if (newSelector && !effectivePriceSelectors.includes(newSelector)) {
+                            // Add to the set for potential saving later (duplicates handled by Set)
+                            if (!newlyFoundSelectors.has(newSelector)) { // Avoid logging repeatedly for the same selector
+                                 log(`Queueing potentially new selector for saving: ${newSelector}`, { productId });
+                                 newlyFoundSelectors.add(newSelector); 
+                            }
+                        }
+                        // --- End Learn New Selector ---
                     }
                 }
 
@@ -2270,12 +2464,10 @@
                 // Mark the card as being processed
                 this.processedCards.add(card);
 
-                // Fetch data with rate limiting
-                const productData = await rateLimiter.executeWithBackoff(async () => {
-                    return await this.dataManager.fetchProductData(productId);
-                });
-                log(`[ARP_EnhanceFlow] [enhanceProductCard] Got productData (cached or fetched) for ${productId}`, { productId });
-                
+                // Fetch data (rate limiting is now handled *inside* fetchProductData)
+                const productData = await this.dataManager.fetchProductData(productId);
+                log(`[ARP_EnhanceFlow] [enhanceProductCard] Got productData for ${productId}`, { productId });
+
                 // Verify element is still valid after async operation
                 if (!document.contains(priceElement)) {
                     log('Price element was removed during async operation', { productId });
@@ -2287,7 +2479,7 @@
                 log('Received product data for enhancement:', productData, { productId });
 
                 const context = this.priceContextCalculator.calculatePageContext(
-                    Array.from(document.querySelectorAll(SELECTORS.productCard))
+                    Array.from(document.querySelectorAll(DEFAULT_SELECTORS.productCard))
                 );
 
                 const bestVariant = this.priceContextCalculator.findBestMatchingVariant(
@@ -2335,14 +2527,21 @@
             const priceRange = this.getPriceRange(productData.variants, productId);
             const displayOptions = {
                 showShipping: true, // Keep flag for potential future use, but won't add text now
-                showMedianIndicator: true,
                 showPriceRange: true,
-                showDistributionGraph: true
+                showDistributionGraph: false 
             };
+            // // price distribution graph is not working so well. ideally itd show the distribution of 
+            // the prices of all the variants on the entire page but we'd have to calculate that after all
+            // the cards have been enhanced and then update all of them retroactively. There's probably a
+            // more elegant way to do this by having some global state that's updated as we enhance each card
+            // and an observer that updates all the cards with the new distribution.
+            // TODO: implement this
+            // TODO: also it'd be cool to show a histogram of all the prices on the page, and a slider to show/hide
+            // products that don't have variants with prices in the selected range. 
 
-            // Start with the total price of the best matching variant
-            const bestVariantTotal = (bestVariant.price?.discountedValue || 0) + (bestVariant.shipping?.cost || 0);
-            let displayText = utils.formatPrice(bestVariantTotal);
+
+            // Start with the min price (which if there is no range, will be the only price)
+            let displayText = utils.formatPrice(priceRange.min);
 
             if (displayOptions.showPriceRange && priceRange.min !== priceRange.max) {
                 // Display the total price range
@@ -2353,23 +2552,21 @@
             // 1. The base shipping cost is > 0
             // 2. There is NO "Choice Free Shipping" option available
             if (bestVariant.shipping?.cost > 0 && !bestVariant.shipping?.hasChoiceFreeShipping) {
-                log(`Adding '(including shipping)' for ${productId} because cost is ${bestVariant.shipping?.cost} and hasChoiceFreeShipping is ${bestVariant.shipping?.hasChoiceFreeShipping}`);
-                displayText += ' (including shipping)';
+                log(`Adding '(including shipping)' for ${productId} because cost is ${bestVariant.shipping?.cost} and hasChoiceFreeShipping is ${bestVariant.shipping?.hasChoiceFreeShipping}`, { productId });
+                displayText += `<br/> <span class="ali-real-price-shipping-note">(including ${utils.formatPrice(bestVariant.shipping.cost)} shipping)</span>`;
             } else {
-                log(`NOT adding '(including shipping)' for ${productId} because cost is ${bestVariant.shipping?.cost} and hasChoiceFreeShipping is ${bestVariant.shipping?.hasChoiceFreeShipping}`);
-            }
-
-            if (displayOptions.showMedianIndicator) {
-                displayText += ' ⊙';
+                log(`NOT adding '(including shipping)' for ${productId} because cost is ${bestVariant.shipping?.cost} and hasChoiceFreeShipping is ${bestVariant.shipping?.hasChoiceFreeShipping}`, { productId });
             }
 
             // Instead of replacing the element, try to modify it in place first
             try {
                 element.className = 'ali-real-price-range ' + element.className;
                 element.innerHTML = displayText;
+                element.parentNode.style.height = 'auto';
+                element.parentNode.style.minHeight = '26px';
 
                 // Add hover events for variant popup
-                const card = element.closest(SELECTORS.productCard);
+                const card = element.closest(DEFAULT_SELECTORS.productCard);
                 if (card) {
                     let popupTimeout;
                     element.addEventListener('mouseenter', () => {
@@ -2405,7 +2602,7 @@
                 container.innerHTML = displayText;
 
                 // Add hover events for variant popup
-                const card = element.closest(SELECTORS.productCard);
+                const card = element.closest(DEFAULT_SELECTORS.productCard);
                 if (card) {
                     let popupTimeout;
                     container.addEventListener('mouseenter', () => {
@@ -2565,6 +2762,30 @@
         }
     }
 
+    // --- Function to save learned selectors --- 
+    async function saveLearnedSelectors() {
+        if (newlyFoundSelectors.size === 0) {
+            log('No new selectors found in this session to save.');
+            return;
+        }
+
+        log(`Saving ${newlyFoundSelectors.size} newly found selectors...`);
+        try {
+            const storedCustomSelectors = await GM.getValue('customPriceSelectors', '[]');
+            let customSelectors = JSON.parse(storedCustomSelectors);
+            if (!Array.isArray(customSelectors)) customSelectors = [];
+
+            // Combine existing with newly found, deduplicate
+            const combinedSelectors = Array.from(new Set([...customSelectors, ...newlyFoundSelectors]));
+
+            await GM.setValue('customPriceSelectors', JSON.stringify(combinedSelectors));
+            log('Successfully saved combined selectors:', combinedSelectors);
+            newlyFoundSelectors.clear(); // Clear the set after saving
+        } catch (e) {
+            log('Error saving learned selectors:', e);
+        }
+    }
+
     // Initialize the userscript
     async function init() {
         log('Initializing script...');
@@ -2575,7 +2796,22 @@
         isCacheDisabled = storedValue;
         log(`[init] Set global isCacheDisabled to: ${isCacheDisabled}`);
 
-        // --- Instantiate LoadingManager AFTER loading preference --- // MOVED LATER
+        // --- Combine Default and Custom Price Selectors ---
+        const storedCustomSelectors = await GM.getValue('customPriceSelectors', '[]');
+        let customSelectors = [];
+        try {
+            customSelectors = JSON.parse(storedCustomSelectors);
+            if (!Array.isArray(customSelectors)) customSelectors = []; // Ensure it's an array
+            log('Loaded custom price selectors:', customSelectors);
+        } catch (e) {
+            log('Error parsing custom price selectors from storage:', e);
+            customSelectors = [];
+        }
+        // Combine default and custom, remove duplicates
+        effectivePriceSelectors = Array.from(new Set([...DEFAULT_SELECTORS.price, ...customSelectors]));
+        log('Effective price selectors:', effectivePriceSelectors);
+
+        // Instantiate LoadingManager AFTER loading preference
         // const loadingManager = new LoadingManager(); // Instance is global now
 
         // Add styles
@@ -2586,18 +2822,23 @@
             log('Error adding styles:', error);
         }
 
-        // Create instances of main classes (except DOMEnhancer)
-        const dataManager = new DataManager();
-        globalCache = dataManager.cache; // Store cache instance globally
+        // --- Create and Initialize CacheManager FIRST --- 
+        const cacheManager = new CacheManager();
+        // REMOVED: globalCache = cacheManager; 
+        await cacheManager.initialize();
+        log('CacheManager initialization awaited.');
+
+        // --- Create DataManager, PriceContextCalculator --- 
+        // Assign to the IIFE-scoped variable
+        dataManager = new DataManager(cacheManager); // Correctly assign instance here
         const priceContextCalculator = new PriceContextCalculator();
-        // const domEnhancer = new DOMEnhancer(dataManager, priceContextCalculator); // MOVED LATER
-
-        // Initialize token
-        await dataManager.initializeToken();
-        log('Token initialized (or checked)');
-
-        // Start observing product cards - COUNT FIRST
-        const productCards = document.querySelectorAll(SELECTORS.productCard);
+  
+        // --- Create DOMEnhancer --- 
+        const domEnhancer = new DOMEnhancer(dataManager, priceContextCalculator);
+        log('DOMEnhancer created');
+ 
+        // --- Observe Initial Cards ---
+        const productCards = document.querySelectorAll(DEFAULT_SELECTORS.productCard);
         log('Found initial product cards:', productCards.length);
         
         // Initialize loading manager with total number of products
@@ -2613,10 +2854,6 @@
             loadingManager.updateProgress(); // Show 0/0
             log(`Loading manager initialized: total=0 (no initial cards)`);
         }
- 
-        // --- Create DOMEnhancer AFTER initializing loadingManager ---
-        const domEnhancer = new DOMEnhancer(dataManager, priceContextCalculator);
-        log('DOMEnhancer created');
  
         // --- Observe Initial Cards ---
         productCards.forEach(card => {
@@ -2642,11 +2879,11 @@
                 mutation.addedNodes.forEach((node) => {
                     if (node.nodeType === Node.ELEMENT_NODE) {
                         // Check if the added node itself is a product card
-                        if (node.matches(SELECTORS.productCard)) {
+                        if (node.matches(DEFAULT_SELECTORS.productCard)) {
                             newCards.push(node);
                         } else {
                             // Check if the added node contains product cards
-                            const cards = node.querySelectorAll(SELECTORS.productCard);
+                            const cards = node.querySelectorAll(DEFAULT_SELECTORS.productCard);
                             if (cards.length > 0) {
                                 newCards.push(...Array.from(cards));
                             }
@@ -2687,6 +2924,22 @@
             subtree: true
         });
         log('Mutation observer started');
+
+        // Add listener to save learned selectors on page unload
+        window.removeEventListener('beforeunload', saveLearnedSelectors); // Remove old listener first
+        window.addEventListener('beforeunload', async () => {
+             log('Running beforeunload tasks...');
+             // Use Promise.all to run tasks concurrently if possible, or sequentially if needed
+             await Promise.all([
+                 saveLearnedSelectors(),
+                 dataManager.cacheManager?.forceSave() // Call forceSave on the global cache instance
+             ]);
+             log('Finished beforeunload tasks.');
+        });
+        log('Updated beforeunload listener to save learned selectors and force cache save.');
+
+        // Initialize token AFTER dataManager is initialized (which includes cache load)
+        await dataManager.initializeToken();
     }
 
     // Start the script
@@ -2703,9 +2956,10 @@
         isCacheDisabled = event.target.checked;
         log('Cache disabled preference changed:', isCacheDisabled);
         await GM.setValue('aliexpress_disable_cache', isCacheDisabled);
-        // Optional: Clear cache when disabling?
-        if (isCacheDisabled && globalCache) {
-             await globalCache.clear();
+        // Optional: Clear cache when disabling? 
+        // Access via the IIFE-scoped dataManager variable
+        if (isCacheDisabled && dataManager && dataManager.cacheManager) {
+             await dataManager.cacheManager.clear(); // Use the correct instance property
              log('Cache cleared because it was disabled.');
              // Optionally alert the user or reload
              // alert('Cache disabled and cleared.');

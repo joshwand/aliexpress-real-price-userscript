@@ -39,8 +39,9 @@ The script works automatically when you browse AliExpress:
 - Hover over prices to see detailed variant information
 - Price ranges show the total cost including shipping
 - A "⊙" indicator shows the most relevant price point
-- A small graph shows where the price falls in the range
 - Free shipping thresholds are displayed when available
+- Status window displays progress in fetching prices
+- Rate-limiting to avoid being blocked by the server
 
 ### Advanced Options
 
@@ -48,6 +49,11 @@ Click the 🐟 icon in the top-right corner to access advanced options:
 
 - **Clear Cache**: Reset the price data cache
 - **Disable Cache**: Turn off caching for real-time price fetching
+- **Move Status Window**: You can drag the status window in case it's in the way.
+## Troubleshooting
+
+If you exceed the API rate limit, you may find the prices are not updating. You can open any product page, and Aliexpress will give you a CAPTCHA to solve. Once you do this, the script will continue working (you may need to refresh the page). You may need to do this periodically depending on your usage.
+
 
 ## How It Works
 
